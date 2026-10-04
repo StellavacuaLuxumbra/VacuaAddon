@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "vacua",
+  "version": "1.0.0",
+  "name": "Vacua Addon",
+  "description": "A Meteor Client addon with TpChase, AutoMapArt, AntiRun, FastFly, ChasePlayer and InkBurrow modules.",
+  "authors": [
+    "Vacua"
+  ],
+  "contact": {},
+  "license": "MIT",
+  "icon": "assets/vacua/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "meteor": [
+      "com.vacua.addon.VacuaAddon"
+    ]
+  },
+  "mixins": [
+    "vacua.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "1.21.1",
+    "java": ">=21",
+    "meteor-client": "*"
+  },
+  "custom": {
+    "meteor-client:color": "165, 42, 42"
+  }
+}
