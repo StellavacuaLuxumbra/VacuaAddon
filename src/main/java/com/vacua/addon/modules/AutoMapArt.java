@@ -17,7 +17,10 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.decoration.ItemFrameEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.network.packet.c2s.play.PlayerInteractBlockC2SPacket;
+import net.minecraft.network.packet.c2s.play.PlayerInteractEntityC2SPacket;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
@@ -28,6 +31,7 @@ import net.minecraft.util.math.Vec3d;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -36,7 +40,8 @@ import java.util.UUID;
 /**
  * AutoMapArt - 自动地图画
  *
- * 在周围地面随机放置展示框并在上面放地图，也可以在敌人面前 airplace 黑曜石 + 展示框地图。
+ * 地面随机/绕脚下循环放置展示框地图，也可以在敌人面前 airplace 黑曜石 + 展示框地图。
+ * 支持发包放置、多次放置、放置速度与移动不关闭等选项。
  */
 public class AutoMapArt extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
@@ -52,14 +57,42 @@ public class AutoMapArt extends Module {
         .name("air-place").description("在敌人面前airplace黑曜石+展示框地图.")
         .defaultValue(true).build());
 
+    private final Setting<Boolean> feetLoop = sgGeneral.add(new BoolSetting.Builder()
+        .name("feet-loop").description("脚下循环放置模式: 绕自己脚下画圈循环放置.")
+        .defaultValue(false)
+        .visible(groundFrames::get).build());
+
     private final Setting<Double> radius = sgGeneral.add(new DoubleSetting.Builder()
         .name("radius").description("地面放置半径.")
         .defaultValue(6.0).range(1.0, 16.0)
         .visible(groundFrames::get).build());
 
+    private final Setting<Double> feetRadius = sgGeneral.add(new DoubleSetting.Builder()
+        .name("feet-radius").description("脚下循环半径.")
+        .defaultValue(1.5).range(0.5, 6.0)
+        .visible(() -> groundFrames.get() && feetLoop.get()).build());
+
+    private final Setting<Double> feetStep = sgGeneral.add(new DoubleSetting.Builder()
+        .name("feet-step").description("脚下循环角度步进(度), 越小越密.")
+        .defaultValue(20.0).range(5.0, 90.0)
+        .visible(() -> groundFrames.get() && feetLoop.get()).build());
+
+    private final Setting<Boolean> packetPlace = sgGeneral.add(new BoolSetting.Builder()
+        .name("packet-place").description("发包放置: 直接发交互包, 不走 interactionManager API.")
+        .defaultValue(true).build());
+
+    private final Setting<Boolean> multiPlace = sgGeneral.add(new BoolSetting.Builder()
+        .name("multi-place").description("每轮同时处理多个放置.")
+        .defaultValue(false).build());
+
+    private final Setting<Integer> placesPerTick = sgGeneral.add(new IntSetting.Builder()
+        .name("places-per-tick").description("每轮最多放置次数.")
+        .defaultValue(3).range(1, 8)
+        .visible(multiPlace::get).build());
+
     private final Setting<Integer> interval = sgGeneral.add(new IntSetting.Builder()
-        .name("interval").description("每次操作间隔(tick).")
-        .defaultValue(4).range(1, 40).build());
+        .name("interval").description("放置速度: 每次操作间隔(tick), 越小越快.")
+        .defaultValue(4).range(0, 40).build());
 
     private final Setting<Double> reach = sgGeneral.add(new DoubleSetting.Builder()
         .name("reach").description("交互距离.")
@@ -76,6 +109,15 @@ public class AutoMapArt extends Module {
     private final Setting<Integer> maxFrames = sgGeneral.add(new IntSetting.Builder()
         .name("max-frames").description("最多放置数量(0=无限).")
         .defaultValue(0).range(0, 500).build());
+
+    private final Setting<Boolean> closeOnMove = sgGeneral.add(new BoolSetting.Builder()
+        .name("close-on-move").description("移动超过距离后自动关闭(默认关闭=移动不关闭).")
+        .defaultValue(false).build());
+
+    private final Setting<Double> moveDistance = sgGeneral.add(new DoubleSetting.Builder()
+        .name("move-distance").description("触发自动关闭的移动距离.")
+        .defaultValue(3.0).range(0.5, 20.0)
+        .visible(closeOnMove::get).build());
 
     // AirPlace
     private final Setting<Double> targetRange = sgAir.add(new DoubleSetting.Builder()
@@ -121,19 +163,31 @@ public class AutoMapArt extends Module {
         boolean airPlace;
         UUID targetId;
         Vec3d look;
+
+        Stage stage = Stage.Frame;
+        int attempts;
+        int ticks;
+        int nextActionTick;
+        boolean acted;
+        boolean done;
+        boolean failed;
     }
 
-    private Job job;
-    private Stage stage;
-    private int attempts;
-    private int timer;
+    private final List<Job> jobs = new ArrayList<>();
+    private int tick;
+    private int roundTimer;
     private int framesPlaced;
     private int startSlot = -1;
+    private int lastSwapTick = Integer.MIN_VALUE / 2;
     private Hand hand = Hand.MAIN_HAND;
     private boolean missingWarned;
+    private double feetAngle;
+    private double feetRingRadius;
+    private Vec3d activatePos;
     private final List<int[]> swaps = new ArrayList<>();
     private final List<BlockPos> completed = new ArrayList<>();
     private final Set<UUID> airDone = new HashSet<>();
+    private final Set<UUID> airPending = new HashSet<>();
     private final Map<UUID, Long> airDoneTime = new HashMap<>();
 
     private static final double[] AIR_YAWS = {0, 30, -30, 180, 90, -90};
@@ -145,33 +199,44 @@ public class AutoMapArt extends Module {
 
     @Override
     public void onActivate() {
-        job = null;
-        stage = null;
-        attempts = 0;
-        timer = 0;
+        jobs.clear();
+        tick = 0;
+        roundTimer = 0;
         framesPlaced = 0;
         hand = Hand.MAIN_HAND;
         missingWarned = false;
+        lastSwapTick = Integer.MIN_VALUE / 2;
+        feetAngle = 0;
+        feetRingRadius = Math.min(feetRadius.get(), ringMax());
         swaps.clear();
         completed.clear();
         airDone.clear();
+        airPending.clear();
         airDoneTime.clear();
         startSlot = mc.player != null ? mc.player.getInventory().selectedSlot : -1;
+        activatePos = mc.player != null ? mc.player.getPos() : null;
     }
 
     @Override
     public void onDeactivate() {
-        job = null;
-        stage = null;
+        jobs.clear();
         restoreSlots();
     }
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
+        tick++;
 
-        if (timer > 0) {
-            timer--;
+        if (closeOnMove.get() && activatePos != null
+            && mc.player.getPos().distanceTo(activatePos) > moveDistance.get()) {
+            info("移动超过 %.1f 格, 自动关闭", moveDistance.get());
+            toggle();
+            return;
+        }
+
+        if (roundTimer > 0) {
+            roundTimer--;
             return;
         }
 
@@ -180,116 +245,153 @@ public class AutoMapArt extends Module {
                 missingWarned = true;
                 warning("背包里缺少物品展示框或填充地图");
             }
+            roundTimer = interval.get();
             return;
         }
         missingWarned = false;
 
-        if (job == null) {
-            job = createJob();
-            if (job == null) {
-                timer = interval.get();
-                return;
-            }
-            stage = job.airPlace ? Stage.Support : Stage.Frame;
-            attempts = 0;
+        int budget = multiPlace.get() ? placesPerTick.get() : 1;
+        int wanted = Math.max(budget, 3);
+        int guard = 0;
+        while (jobs.size() < wanted && guard++ < 12) {
+            Job job = createJob();
+            if (job == null) break;
+            jobs.add(job);
         }
 
-        switch (stage) {
-            case Support -> handleSupport();
-            case Frame -> handleFrame();
-            case Insert -> handleInsert();
+        int actions = 0;
+        Iterator<Job> it = jobs.iterator();
+        while (it.hasNext()) {
+            if (actions >= budget) break;
+
+            Job job = it.next();
+            if (job.nextActionTick > tick) continue;
+
+            processJob(job);
+
+            if (job.done) {
+                it.remove();
+                complete(job);
+                if (maxFrames.get() > 0 && framesPlaced >= maxFrames.get()) {
+                    info("已放置 %d 个地图画", framesPlaced);
+                    toggle();
+                    return;
+                }
+            } else if (job.failed) {
+                it.remove();
+                discard(job);
+            } else if (job.acted) {
+                actions++;
+            }
+        }
+
+        roundTimer = interval.get();
+    }
+
+    private void processJob(Job job) {
+        job.acted = false;
+        job.done = false;
+        job.failed = false;
+        job.ticks++;
+
+        if (job.ticks > 400) {
+            job.failed = true;
+            return;
+        }
+
+        switch (job.stage) {
+            case Support -> handleSupport(job);
+            case Frame -> handleFrame(job);
+            case Insert -> handleInsert(job);
         }
     }
 
-    private void handleSupport() {
+    private void handleSupport(Job job) {
         if (!mc.world.getBlockState(job.support).isAir()) {
-            stage = Stage.Frame;
-            attempts = 0;
-            timer = interval.get();
+            job.stage = Stage.Frame;
+            job.attempts = 0;
+            job.ticks = 0;
             return;
         }
 
-        if (!selectItem(Items.OBSIDIAN)) {
-            timer = interval.get();
-            return;
-        }
+        if (!selectItem(Items.OBSIDIAN)) return;
 
         Vec3d towardPlayer = mc.player.getPos().subtract(job.support.toCenterPos());
         Direction toPlayer = Direction.getFacing(towardPlayer.x, 0, towardPlayer.z);
 
-        Direction clickSide = toPlayer;
+        Direction solid = null;
         for (Direction d : Direction.values()) {
-            if (!mc.world.getBlockState(job.support.offset(d)).isAir()) {
-                clickSide = d;
+            if (isSolid(job.support.offset(d))) {
+                solid = d;
                 break;
             }
         }
 
-        placeOn(job.support.offset(clickSide), clickSide.getOpposite());
+        if (solid != null) placeOn(job.support.offset(solid), solid.getOpposite());
+        else placeOn(job.support, toPlayer);
 
-        attempts++;
-        timer = interval.get();
-        if (attempts > 5) discardJob("airplace黑曜石失败");
+        act(job, 0);
+        if (job.attempts > 10) job.failed = true;
     }
 
-    private void handleFrame() {
+    private void handleFrame(Job job) {
         ItemFrameEntity existing = findFrameEntity(job.framePos);
         if (existing != null) {
             if (!existing.getHeldItemStack().isEmpty()) {
-                discardJob(null);
+                job.failed = true;
                 return;
             }
-            stage = Stage.Insert;
-            attempts = 0;
+            job.stage = Stage.Insert;
+            job.attempts = 0;
+            job.ticks = 0;
             return;
         }
 
         if (!mc.world.getBlockState(job.framePos).isAir()) {
-            discardJob(null);
+            job.failed = true;
             return;
         }
 
-        if (!selectItem(Items.ITEM_FRAME)) {
-            timer = interval.get();
-            return;
-        }
+        if (!selectItem(Items.ITEM_FRAME)) return;
 
         placeOn(job.support, job.face);
 
-        attempts++;
-        timer = Math.max(interval.get(), 5);
-        if (attempts > 5) discardJob("放置展示框失败");
+        act(job, 5);
+        if (job.attempts > 10) job.failed = true;
     }
 
-    private void handleInsert() {
+    private void handleInsert(Job job) {
         ItemFrameEntity frame = findFrameEntity(job.framePos);
         if (frame == null) {
-            attempts++;
-            timer = interval.get();
-            if (attempts > 10) discardJob("找不到展示框");
+            job.attempts++;
+            job.nextActionTick = tick + 2;
+            if (job.attempts > 15) job.failed = true;
             return;
         }
 
         if (!frame.getHeldItemStack().isEmpty()) {
-            completeJob();
+            job.done = true;
             return;
         }
 
-        if (!selectItem(Items.FILLED_MAP)) {
-            timer = interval.get();
-            return;
-        }
+        if (!selectItem(Items.FILLED_MAP)) return;
 
         Vec3d look = job.look;
         Hand h = hand;
         withRotation(look, () -> {
-            mc.interactionManager.interactEntity(mc.player, frame, h);
+            interactEntity(frame, h);
             mc.player.swingHand(h);
         });
 
-        attempts++;
-        timer = interval.get();
-        if (attempts > 5) discardJob("放入地图失败");
+        act(job, 0);
+        if (job.attempts > 10) job.failed = true;
+    }
+
+    private void act(Job job, int cooldown) {
+        job.acted = true;
+        job.attempts++;
+        job.ticks = 0;
+        job.nextActionTick = tick + cooldown;
     }
 
     private void placeOn(BlockPos support, Direction face) {
@@ -301,9 +403,25 @@ public class AutoMapArt extends Module {
         BlockHitResult hit = new BlockHitResult(hitVec, face, support, false);
         Hand h = hand;
         withRotation(hitVec, () -> {
-            mc.interactionManager.interactBlock(mc.player, h, hit);
+            sendInteractBlock(h, hit);
             mc.player.swingHand(h);
         });
+    }
+
+    private void sendInteractBlock(Hand h, BlockHitResult hit) {
+        if (packetPlace.get() && mc.getNetworkHandler() != null) {
+            mc.getNetworkHandler().sendPacket(new PlayerInteractBlockC2SPacket(h, hit, 0));
+        } else {
+            mc.interactionManager.interactBlock(mc.player, h, hit);
+        }
+    }
+
+    private void interactEntity(ItemFrameEntity frame, Hand h) {
+        if (packetPlace.get() && mc.getNetworkHandler() != null) {
+            mc.getNetworkHandler().sendPacket(PlayerInteractEntityC2SPacket.interact(frame, mc.player.isSneaking(), h));
+        } else {
+            mc.interactionManager.interactEntity(mc.player, frame, h);
+        }
     }
 
     private void withRotation(Vec3d look, Runnable action) {
@@ -320,12 +438,16 @@ public class AutoMapArt extends Module {
             PlayerEntity target = getClosestPlayer();
             if (target != null && canTarget(target)) {
                 Job airJob = createAirJob(target);
-                if (airJob != null) return airJob;
+                if (airJob != null) {
+                    airPending.add(target.getUuid());
+                    return airJob;
+                }
             }
         }
 
         if (groundFrames.get()) {
-            for (int i = 0; i < 12; i++) {
+            if (feetLoop.get()) return createFeetLoopJob();
+            for (int i = 0; i < 8; i++) {
                 Job groundJob = createGroundJob();
                 if (groundJob != null) return groundJob;
             }
@@ -335,6 +457,7 @@ public class AutoMapArt extends Module {
 
     private boolean canTarget(PlayerEntity target) {
         UUID id = target.getUuid();
+        if (airPending.contains(id)) return false;
         if (!airDone.contains(id)) return true;
         if (!repeat.get()) return false;
         return System.currentTimeMillis() >= airDoneAt(id) + repeatInterval.get() * 50L;
@@ -375,6 +498,7 @@ public class AutoMapArt extends Module {
                 result.framePos = framePos;
                 result.airPlace = true;
                 result.targetId = target.getUuid();
+                result.stage = Stage.Support;
                 result.look = Vec3d.ofCenter(framePos);
                 return result;
             }
@@ -391,30 +515,78 @@ public class AutoMapArt extends Module {
         double x = mc.player.getX() + Math.cos(angle) * dist;
         double z = mc.player.getZ() + Math.sin(angle) * dist;
 
-        BlockPos ground = null;
-        for (int dy = 3; dy >= -8; dy--) {
-            BlockPos pos = BlockPos.ofFloored(x, mc.player.getY() + dy, z);
-            if (isSolid(pos) && mc.world.isAir(pos.up())) {
-                ground = pos;
-                break;
-            }
-        }
+        BlockPos ground = findGround(x, z);
         if (ground == null) return null;
 
         BlockPos framePos = ground.up();
-        BlockPos self = mc.player.getBlockPos();
-        if (framePos.equals(self) || framePos.equals(self.up())) return null;
-        if (mc.player.getEyePos().distanceTo(Vec3d.ofCenter(framePos)) > Math.min(reach.get(), 3.0)) return null;
-        if (findFrameEntity(framePos) != null) return null;
+        if (!isValidFramePos(framePos)) return null;
 
         Job result = new Job();
         result.support = ground;
         result.face = Direction.UP;
         result.framePos = framePos;
-        result.airPlace = false;
-        result.targetId = null;
+        result.stage = Stage.Frame;
         result.look = Vec3d.ofCenter(framePos);
         return result;
+    }
+
+    private Job createFeetLoopJob() {
+        BlockPos center = mc.player.getBlockPos();
+        double maxRing = ringMax();
+
+        for (int i = 0; i < 6; i++) {
+            double ang = Math.toRadians(feetAngle);
+            double x = center.getX() + 0.5 + Math.cos(ang) * feetRingRadius;
+            double z = center.getZ() + 0.5 + Math.sin(ang) * feetRingRadius;
+            advanceFeet(maxRing);
+
+            BlockPos ground = findGround(x, z);
+            if (ground == null) continue;
+
+            BlockPos framePos = ground.up();
+            if (!isValidFramePos(framePos)) continue;
+
+            Job result = new Job();
+            result.support = ground;
+            result.face = Direction.UP;
+            result.framePos = framePos;
+            result.stage = Stage.Frame;
+            result.look = Vec3d.ofCenter(framePos);
+            return result;
+        }
+        return null;
+    }
+
+    private void advanceFeet(double maxRing) {
+        feetAngle += feetStep.get();
+        if (feetAngle >= 360.0) {
+            feetAngle -= 360.0;
+            feetRingRadius += 1.0;
+            if (feetRingRadius > maxRing) feetRingRadius = Math.min(feetRadius.get(), maxRing);
+        }
+    }
+
+    private double ringMax() {
+        double max = Math.min(radius.get(), Math.min(reach.get(), 3.0));
+        return Math.max(1.0, max);
+    }
+
+    private boolean isValidFramePos(BlockPos framePos) {
+        BlockPos self = mc.player.getBlockPos();
+        if (framePos.equals(self) || framePos.equals(self.up()) || framePos.equals(self.down())) return false;
+        if (mc.player.getEyePos().distanceTo(Vec3d.ofCenter(framePos)) > Math.min(reach.get(), 3.0)) return false;
+        for (Job job : jobs) {
+            if (job.framePos.equals(framePos)) return false;
+        }
+        return findFrameEntity(framePos) == null;
+    }
+
+    private BlockPos findGround(double x, double z) {
+        for (int dy = 3; dy >= -8; dy--) {
+            BlockPos pos = BlockPos.ofFloored(x, mc.player.getY() + dy, z);
+            if (isSolid(pos) && mc.world.isAir(pos.up())) return pos;
+        }
+        return null;
     }
 
     private boolean isSolid(BlockPos pos) {
@@ -469,9 +641,14 @@ public class AutoMapArt extends Module {
 
         FindItemResult anywhere = InvUtils.find(item);
         if (anywhere.found() && anywhere.isMain()) {
-            int hotbarSlot = mc.player.getInventory().selectedSlot;
-            InvUtils.quickSwap().fromId(hotbarSlot).to(anywhere.slot());
-            swaps.add(new int[]{hotbarSlot, anywhere.slot()});
+            if (tick - lastSwapTick < 2) return false;
+
+            int slot = findFreeHotbarSlot();
+            if (slot < 0) return false;
+
+            InvUtils.quickSwap().fromId(slot).to(anywhere.slot());
+            swaps.add(new int[]{slot, anywhere.slot()});
+            lastSwapTick = tick;
             return false;
         }
 
@@ -480,6 +657,25 @@ public class AutoMapArt extends Module {
             warning("背包里没有 " + item.getName().getString());
         }
         return false;
+    }
+
+    private int findFreeHotbarSlot() {
+        if (mc.player == null) return -1;
+        var inv = mc.player.getInventory();
+        int selected = inv.selectedSlot;
+
+        if (isFreeHotbar(inv.getStack(selected))) return selected;
+        for (int i = 0; i < 9; i++) {
+            if (i == selected) continue;
+            if (isFreeHotbar(inv.getStack(i))) return i;
+        }
+        return -1;
+    }
+
+    private boolean isFreeHotbar(ItemStack stack) {
+        if (stack.isEmpty()) return true;
+        Item item = stack.getItem();
+        return item != Items.ITEM_FRAME && item != Items.FILLED_MAP && item != Items.OBSIDIAN;
     }
 
     private void restoreSlots() {
@@ -495,47 +691,35 @@ public class AutoMapArt extends Module {
         startSlot = -1;
     }
 
-    private void completeJob() {
-        if (job == null) return;
-
+    private void complete(Job job) {
         completed.add(job.framePos);
         while (completed.size() > 200) completed.remove(0);
 
-        if (job.airPlace && job.targetId != null) {
+        if (job.targetId != null) {
             airDone.add(job.targetId);
             airDoneTime.put(job.targetId, System.currentTimeMillis());
+            airPending.remove(job.targetId);
         }
 
         framesPlaced++;
-        job = null;
-        stage = null;
-        attempts = 0;
-        timer = interval.get();
-
-        if (maxFrames.get() > 0 && framesPlaced >= maxFrames.get()) {
-            info("已放置 %d 个地图画", framesPlaced);
-            toggle();
-        }
     }
 
-    private void discardJob(String message) {
-        job = null;
-        stage = null;
-        attempts = 0;
-        timer = interval.get();
-        if (message != null) info(message);
+    private void discard(Job job) {
+        if (job.targetId != null) airPending.remove(job.targetId);
     }
 
     @EventHandler
     private void onRender3D(Render3DEvent event) {
         if (!render.get() || mc.player == null) return;
 
-        if (job != null) {
+        if (!jobs.isEmpty()) {
             Color pending = new Color(pendingColor.get());
             Color pendingOutline = new Color(pendingColor.get().r, pendingColor.get().g, pendingColor.get().b, 255);
-            event.renderer.box(new Box(job.framePos), pending, pendingOutline, ShapeMode.Both, 0);
-            if (job.airPlace) {
-                event.renderer.box(new Box(job.support), pending, pendingOutline, ShapeMode.Both, 0);
+            for (Job job : jobs) {
+                event.renderer.box(new Box(job.framePos), pending, pendingOutline, ShapeMode.Both, 0);
+                if (job.airPlace) {
+                    event.renderer.box(new Box(job.support), pending, pendingOutline, ShapeMode.Both, 0);
+                }
             }
         }
 
