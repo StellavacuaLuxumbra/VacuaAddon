@@ -3,7 +3,7 @@
   "id": "vacua",
   "version": "${version}",
   "name": "Vacua Addon",
-  "description": "A Meteor Client addon with TpChase, AutoMapArt, AntiRun, FastFly, ChasePlayer and InkBurrow modules.",
+  "description": "A Meteor Client addon with TpChase, AutoMapArt, AntiRun, FastFly, ChasePlayer, TpBot and AntiCrash modules.",
   "authors": [
     "Vacua"
   ],
