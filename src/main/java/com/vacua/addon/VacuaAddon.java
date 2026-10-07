@@ -6,6 +6,7 @@ import com.vacua.addon.modules.AutoEz;
 import com.vacua.addon.modules.AutoMapArt;
 import com.vacua.addon.modules.ChasePlayer;
 import com.vacua.addon.modules.FastFly;
+import com.vacua.addon.modules.InkAutoLogin;
 import com.vacua.addon.modules.NoGround;
 import com.vacua.addon.modules.NoLoadScreen;
 import com.vacua.addon.modules.PhaseCheck;
@@ -41,6 +42,7 @@ public class VacuaAddon extends MeteorAddon {
         Modules.get().add(new Vclip());
         Modules.get().add(new PhaseCheck());
         Modules.get().add(new SetVelocity());
+        Modules.get().add(new InkAutoLogin());
     }
 
     @Override

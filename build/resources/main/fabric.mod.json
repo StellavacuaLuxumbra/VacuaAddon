@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "id": "vacua",
-  "version": "1.0.0",
+  "version": "1.1",
   "name": "Vacua Addon",
-  "description": "A Meteor Client addon with TpChase, AutoMapArt, AntiRun, FastFly, ChasePlayer, TpBot, AntiCrash, NoLoadScreen, NoGround, AutoEz, Vclip, PhaseCheck and SetVelocity modules.",
+  "description": "A Meteor Client addon with TpChase, AutoMapArt, AntiRun, FastFly, ChasePlayer, TpBot, AntiCrash, InkAutoLogin, NoLoadScreen, NoGround, AutoEz, Vclip, PhaseCheck and SetVelocity modules.",
   "authors": [
     "Vacua"
   ],
