@@ -2,11 +2,17 @@ package com.vacua.addon;
 
 import com.vacua.addon.modules.AntiCrash;
 import com.vacua.addon.modules.AntiRun;
+import com.vacua.addon.modules.AutoEz;
 import com.vacua.addon.modules.AutoMapArt;
 import com.vacua.addon.modules.ChasePlayer;
 import com.vacua.addon.modules.FastFly;
+import com.vacua.addon.modules.NoGround;
+import com.vacua.addon.modules.NoLoadScreen;
+import com.vacua.addon.modules.PhaseCheck;
+import com.vacua.addon.modules.SetVelocity;
 import com.vacua.addon.modules.TpBot;
 import com.vacua.addon.modules.TpChase;
+import com.vacua.addon.modules.Vclip;
 import meteordevelopment.meteorclient.addons.GithubRepo;
 import meteordevelopment.meteorclient.addons.MeteorAddon;
 import meteordevelopment.meteorclient.systems.modules.Category;
@@ -29,6 +35,12 @@ public class VacuaAddon extends MeteorAddon {
         Modules.get().add(new AntiRun());
         Modules.get().add(new TpBot());
         Modules.get().add(new AntiCrash());
+        Modules.get().add(new NoLoadScreen());
+        Modules.get().add(new NoGround());
+        Modules.get().add(new AutoEz());
+        Modules.get().add(new Vclip());
+        Modules.get().add(new PhaseCheck());
+        Modules.get().add(new SetVelocity());
     }
 
     @Override
